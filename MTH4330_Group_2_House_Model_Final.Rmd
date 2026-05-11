@@ -1,0 +1,873 @@
+---
+title: "Staten Island Housing Price Prediction"
+author: "Yizheng Li, Fuming Xu, Kunyu Liang, Tong Pang"
+date: "2026-04-21"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+subtitle: NYC Property Sales ML Project
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+## 1. Load Data and Preprocessing
+
+This section loads the Staten Island rolling sales file, cleans the data, keeps selected residential property types, creates the `AGE` and `SALE.MONTH` features, and one-hot encodes categorical variables.
+
+Main cleaning steps:
+
+- Remove non-useful columns such as address, apartment number, lot, block, and present tax/building class fields.
+- Remove sales below $50,000 (non-market transfers and intra-family deed transfers).
+- Remove invalid rows with missing or zero values for year built, land square feet, and gross square feet.
+- Keep selected residential building class categories.
+- Add `AGE = sale year - year built`.
+- One-hot encode ZIP code, tax class, sale month, neighborhood, building class category, and building class at time of sale.
+
+```{r load_data}
+# Packages
+needed_packages <- c("readxl", "readr", "lubridate", "randomForest")
+installed_packages <- rownames(installed.packages())
+
+for (pkg in needed_packages) {
+  if (!(pkg %in% installed_packages)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+  }
+}
+
+library(readxl)
+library(readr)
+library(lubridate)
+library(randomForest)
+
+# ---------------------------------------------------------
+# Read data
+# ---------------------------------------------------------
+
+possible_excel_files <- list.files(
+  pattern = "rollingsales_statenisland.*\\.xlsx$",
+  ignore.case = TRUE
+)
+
+possible_csv_files <- list.files(
+  pattern = "rollingsales_statenisland.*\\.csv$",
+  ignore.case = TRUE
+)
+
+if (length(possible_excel_files) > 0) {
+  data_file <- possible_excel_files[1]
+  df <- read_excel(data_file, skip = 4)
+  df <- as.data.frame(df)
+} else if (length(possible_csv_files) > 0) {
+  data_file <- possible_csv_files[1]
+  df <- read_csv(data_file, skip = 4, show_col_types = FALSE)
+  df <- as.data.frame(df)
+} else {
+  stop("Data file not found. Put rollingsales_statenisland Excel or CSV file in the same folder as this Rmd file.")
+}
+
+cat("Using file:", data_file, "\n")
+
+names(df) <- make.names(trimws(names(df)))
+
+cat("Raw rows:", nrow(df), "\n")
+cat("Raw columns:", ncol(df), "\n")
+
+# ---------------------------------------------------------
+# Clean text columns
+# ---------------------------------------------------------
+
+text_cols <- c(
+  "BUILDING.CLASS.CATEGORY",
+  "BUILDING.CLASS.AT.TIME.OF.SALE",
+  "NEIGHBORHOOD"
+)
+
+for (col in text_cols) {
+  if (col %in% names(df)) {
+    df[[col]] <- trimws(as.character(df[[col]]))
+  }
+}
+
+# ---------------------------------------------------------
+# Clean numeric columns
+# ---------------------------------------------------------
+
+num_cols_to_clean <- c(
+  "SALE.PRICE",
+  "GROSS.SQUARE.FEET",
+  "LAND.SQUARE.FEET",
+  "RESIDENTIAL.UNITS",
+  "COMMERCIAL.UNITS",
+  "YEAR.BUILT",
+  "ZIP.CODE",
+  "TAX.CLASS.AT.TIME.OF.SALE"
+)
+
+for (col in num_cols_to_clean) {
+  if (col %in% names(df)) {
+    df[[col]] <- parse_number(as.character(df[[col]]))
+  }
+}
+
+# ---------------------------------------------------------
+# Keep selected residential building class categories
+# ---------------------------------------------------------
+
+keep_categories <- c(
+  "01 ONE FAMILY DWELLINGS",
+  "02 TWO FAMILY DWELLINGS",
+  "03 THREE FAMILY DWELLINGS",
+  "04 TAX CLASS 1 CONDOS",
+  "07 RENTALS - WALKUP APARTMENTS",
+  "09 COOPS - WALKUP APARTMENTS",
+  "10 COOPS - ELEVATOR APARTMENTS",
+  "12 CONDOS - WALKUP APARTMENTS",
+  "13 CONDOS - ELEVATOR APARTMENTS",
+  "15 CONDOS - 2-10 UNIT RESIDENTIAL"
+)
+
+df <- df[df$BUILDING.CLASS.CATEGORY %in% keep_categories, ]
+
+# ---------------------------------------------------------
+# Basic cleaning
+# ---------------------------------------------------------
+
+df <- df[
+  !is.na(df$SALE.PRICE) &
+    df$SALE.PRICE >= 50000,
+]
+
+df <- df[
+  !is.na(df$YEAR.BUILT) &
+    df$YEAR.BUILT > 0,
+]
+
+df <- df[
+  !is.na(df$GROSS.SQUARE.FEET) &
+    df$GROSS.SQUARE.FEET > 0,
+]
+
+df <- df[
+  !is.na(df$LAND.SQUARE.FEET) &
+    df$LAND.SQUARE.FEET > 0,
+]
+
+# ---------------------------------------------------------
+# Date features
+# ---------------------------------------------------------
+
+if (!(inherits(df$SALE.DATE, "Date") ||
+      inherits(df$SALE.DATE, "POSIXct") ||
+      inherits(df$SALE.DATE, "POSIXt"))) {
+  df$SALE.DATE <- parse_date_time(
+    as.character(df$SALE.DATE),
+    orders = c("ymd", "mdy", "dmy")
+  )
+}
+
+df$AGE <- year(df$SALE.DATE) - df$YEAR.BUILT
+df$SALE.MONTH <- month(df$SALE.DATE)
+
+df <- df[
+  !is.na(df$AGE) &
+    df$AGE >= 0,
+]
+
+df$YEAR.BUILT <- NULL
+
+# ---------------------------------------------------------
+# Remove unnecessary columns
+# ---------------------------------------------------------
+
+remove_cols <- c(
+  "BOROUGH",
+  "LOT",
+  "EASEMENT",
+  "ADDRESS",
+  "APARTMENT.NUMBER",
+  "TOTAL.UNITS",
+  "BLOCK",
+  "SALE.DATE",
+  "TAX.CLASS.AT.PRESENT",
+  "BUILDING.CLASS.AT.PRESENT"
+)
+
+for (col in remove_cols) {
+  if (col %in% names(df)) {
+    df[[col]] <- NULL
+  }
+}
+
+# ---------------------------------------------------------
+# Remove rows with missing required columns
+# ---------------------------------------------------------
+
+required_cols <- c(
+  "SALE.PRICE",
+  "GROSS.SQUARE.FEET",
+  "LAND.SQUARE.FEET",
+  "RESIDENTIAL.UNITS",
+  "COMMERCIAL.UNITS",
+  "AGE",
+  "ZIP.CODE",
+  "TAX.CLASS.AT.TIME.OF.SALE",
+  "SALE.MONTH",
+  "NEIGHBORHOOD",
+  "BUILDING.CLASS.CATEGORY",
+  "BUILDING.CLASS.AT.TIME.OF.SALE"
+)
+
+df <- df[complete.cases(df[, required_cols]), ]
+
+# ---------------------------------------------------------
+# One-hot encoding with one reference category dropped
+# ---------------------------------------------------------
+
+one_hot_drop_reference <- function(col_name, data) {
+
+  if (!(col_name %in% names(data))) {
+    return(data.frame())
+  }
+
+  data[[col_name]] <- as.factor(data[[col_name]])
+
+  if (length(unique(data[[col_name]])) < 2) {
+    return(data.frame())
+  }
+
+  formula_text <- paste("~", col_name)
+  encoded <- model.matrix(as.formula(formula_text), data = data)
+
+  encoded <- encoded[, colnames(encoded) != "(Intercept)", drop = FALSE]
+  encoded <- as.data.frame(encoded)
+  names(encoded) <- make.names(names(encoded))
+
+  return(encoded)
+}
+
+df$ZIP.CODE <- as.factor(df$ZIP.CODE)
+df$TAX.CLASS.AT.TIME.OF.SALE <- as.factor(df$TAX.CLASS.AT.TIME.OF.SALE)
+df$SALE.MONTH <- as.factor(df$SALE.MONTH)
+df$NEIGHBORHOOD <- as.factor(df$NEIGHBORHOOD)
+df$BUILDING.CLASS.CATEGORY <- as.factor(df$BUILDING.CLASS.CATEGORY)
+df$BUILDING.CLASS.AT.TIME.OF.SALE <- as.factor(df$BUILDING.CLASS.AT.TIME.OF.SALE)
+
+zip_encoded <- one_hot_drop_reference("ZIP.CODE", df)
+tax_encoded <- one_hot_drop_reference("TAX.CLASS.AT.TIME.OF.SALE", df)
+month_encoded <- one_hot_drop_reference("SALE.MONTH", df)
+neighborhood_encoded <- one_hot_drop_reference("NEIGHBORHOOD", df)
+building_category_encoded <- one_hot_drop_reference("BUILDING.CLASS.CATEGORY", df)
+building_timeofsale_encoded <- one_hot_drop_reference("BUILDING.CLASS.AT.TIME.OF.SALE", df)
+
+df <- cbind(
+  df,
+  zip_encoded,
+  tax_encoded,
+  month_encoded,
+  neighborhood_encoded,
+  building_category_encoded,
+  building_timeofsale_encoded
+)
+
+df$ZIP.CODE <- NULL
+df$TAX.CLASS.AT.TIME.OF.SALE <- NULL
+df$SALE.MONTH <- NULL
+df$NEIGHBORHOOD <- NULL
+df$BUILDING.CLASS.CATEGORY <- NULL
+df$BUILDING.CLASS.AT.TIME.OF.SALE <- NULL
+
+# ---------------------------------------------------------
+# Define feature groups
+# ---------------------------------------------------------
+
+numeric_cols <- c(
+  "GROSS.SQUARE.FEET",
+  "LAND.SQUARE.FEET",
+  "RESIDENTIAL.UNITS",
+  "COMMERCIAL.UNITS",
+  "AGE"
+)
+
+zip_cols <- grep("^ZIP.CODE", names(df), value = TRUE)
+tax_cols <- grep("^TAX.CLASS.AT.TIME.OF.SALE", names(df), value = TRUE)
+month_cols <- grep("^SALE.MONTH", names(df), value = TRUE)
+neighborhood_cols <- grep("^NEIGHBORHOOD", names(df), value = TRUE)
+building_category_cols <- grep("^BUILDING.CLASS.CATEGORY", names(df), value = TRUE)
+building_timeofsale_cols <- grep("^BUILDING.CLASS.AT.TIME.OF.SALE", names(df), value = TRUE)
+
+all_features <- c(
+  numeric_cols,
+  zip_cols,
+  tax_cols,
+  month_cols,
+  neighborhood_cols,
+  building_category_cols,
+  building_timeofsale_cols
+)
+
+model_df <- df[, c(all_features, "SALE.PRICE")]
+model_df <- na.omit(model_df)
+
+# ---------------------------------------------------------
+# Log-transform SALE.PRICE
+# Log transformation stabilizes variance and reduces the
+# influence of very expensive properties on model fitting.
+# Predictions will be in log-dollars and converted back
+# using exp() for reporting in dollar terms.
+# ---------------------------------------------------------
+model_df$LOG.SALE.PRICE <- log(model_df$SALE.PRICE)
+model_df$SALE.PRICE     <- NULL
+
+cat("Final rows after cleaning:", nrow(model_df), "\n")
+cat("Final columns:", ncol(model_df), "\n")
+cat("Features:", length(all_features), "\n")
+cat("ZIP dummy columns:", length(zip_cols), "\n")
+cat("Neighborhood dummy columns:", length(neighborhood_cols), "\n")
+cat("Building category dummy columns:", length(building_category_cols), "\n")
+cat("Building at time of sale dummy columns:", length(building_timeofsale_cols), "\n")
+
+head(model_df, 5)
+```
+
+## 2. Train / Development / Final Test Split
+
+```{r split}
+set.seed(1)
+
+n <- nrow(model_df)
+
+all_index <- sample(1:n)
+
+train_size <- floor(0.60 * n)
+dev_size <- floor(0.20 * n)
+
+train_index <- all_index[1:train_size]
+
+dev_index <- all_index[
+  (train_size + 1):(train_size + dev_size)
+]
+
+test_index <- all_index[
+  (train_size + dev_size + 1):n
+]
+
+DataFrameTrain <- model_df[train_index, ]
+DataFrameDev <- model_df[dev_index, ]
+DataFrameFinalTest <- model_df[test_index, ]
+
+cat("Training rows:", nrow(DataFrameTrain), "\n")
+cat("Development rows:", nrow(DataFrameDev), "\n")
+cat("Final test rows:", nrow(DataFrameFinalTest), "\n")
+
+```
+
+## 3. Evaluation Function
+
+```{r evaluation_function}
+# All models are trained on LOG.SALE.PRICE.
+# evaluate_model takes log-scale actual and predicted values,
+# converts predictions back to dollars using exp(),
+# then computes RMSE and MAE in dollars for interpretability.
+evaluate_model <- function(actual_log, predicted_log) {
+
+  # Convert back to dollar scale
+  actual_dollars    <- exp(actual_log)
+  predicted_dollars <- exp(predicted_log)
+
+  # Metrics in dollar scale
+  mse   <- mean((actual_dollars - predicted_dollars)^2)
+  rmse  <- sqrt(mse)
+  mae   <- mean(abs(actual_dollars - predicted_dollars))
+
+  # R2 computed on log scale (standard practice)
+  ss_res <- sum((actual_log - predicted_log)^2)
+  ss_tot <- sum((actual_log - mean(actual_log))^2)
+  r2     <- 1 - ss_res / ss_tot
+
+  return(list(
+    MSE  = mse,
+    RMSE = rmse,
+    MAE  = mae,
+    R2   = r2
+  ))
+}
+```
+
+## 4. Model 1: Multiple Linear Regression
+
+```{r linear_regression}
+formula_lr <- as.formula(
+  paste("LOG.SALE.PRICE ~", paste(all_features, collapse = " + "))
+)
+
+LR_fit <- lm(formula_lr, data = DataFrameTrain)
+
+predict_train_lr <- predict(LR_fit, newdata = DataFrameTrain)
+predict_dev_lr   <- predict(LR_fit, newdata = DataFrameDev)
+
+lr_train_metrics <- evaluate_model(DataFrameTrain$LOG.SALE.PRICE, predict_train_lr)
+lr_dev_metrics   <- evaluate_model(DataFrameDev$LOG.SALE.PRICE,   predict_dev_lr)
+
+cat("Linear Regression Training RMSE: $", round(lr_train_metrics$RMSE), "\n")
+cat("Linear Regression Dev     RMSE: $", round(lr_dev_metrics$RMSE),   "\n")
+cat("Linear Regression Dev     MAE:  $", round(lr_dev_metrics$MAE),    "\n")
+cat("Linear Regression Dev     R2:  ",   round(lr_dev_metrics$R2, 4),  "\n")
+
+cat("First 10 coefficients:\n")
+print(head(coef(LR_fit), 10))
+```
+
+## 4.1 Linear Regression Residual Plot on Development Set
+
+```{r linear_regression_residual_plot}
+# Convert back to dollars for plotting
+actual_dollars_dev_lr <- exp(DataFrameDev$LOG.SALE.PRICE)
+pred_dollars_dev_lr   <- exp(predict_dev_lr)
+
+plot(
+  pred_dollars_dev_lr,
+  actual_dollars_dev_lr - pred_dollars_dev_lr,
+  main = "Linear Regression Residuals on Development Set",
+  xlab = "Predicted Sale Price ($)",
+  ylab = "Residuals ($)",
+  col = "steelblue",
+  pch = 19,
+  cex = 0.5
+)
+abline(h = 0, col = "red", lwd = 2)
+```
+
+## 4.2 Linear Regression: Actual vs Predicted on Development Set
+
+```{r linear_actual_vs_predicted}
+plot(
+  actual_dollars_dev_lr,
+  pred_dollars_dev_lr,
+  main = "Linear Regression: Actual vs Predicted",
+  xlab = "Actual Sale Price ($)",
+  ylab = "Predicted Sale Price ($)",
+  col = "steelblue",
+  pch = 19,
+  cex = 0.5
+)
+abline(a = 0, b = 1, col = "red", lwd = 2)
+```
+
+## 5. Model 2: Polynomial Regression
+
+```{r polynomial_regression}
+cat_terms <- paste(
+  c(
+    zip_cols, tax_cols, month_cols, neighborhood_cols,
+    building_category_cols, building_timeofsale_cols
+  ),
+  collapse = " + "
+)
+
+poly_results  <- data.frame(
+  Degree           = integer(),
+  Training_RMSE    = numeric(),
+  Development_RMSE = numeric(),
+  Development_MAE  = numeric(),
+  Development_R2   = numeric()
+)
+
+for (degree in 1:4) {
+  poly_terms <- paste(
+    paste0("poly(", numeric_cols, ", ", degree, ", raw=TRUE)"),
+    collapse = " + "
+  )
+  formula_poly_i <- as.formula(
+    paste("LOG.SALE.PRICE ~", poly_terms, "+", cat_terms)
+  )
+  fit_poly_i   <- lm(formula_poly_i, data = DataFrameTrain)
+  pred_train_i <- predict(fit_poly_i, newdata = DataFrameTrain)
+  pred_dev_i   <- predict(fit_poly_i, newdata = DataFrameDev)
+
+  train_m <- evaluate_model(DataFrameTrain$LOG.SALE.PRICE, pred_train_i)
+  dev_m   <- evaluate_model(DataFrameDev$LOG.SALE.PRICE,   pred_dev_i)
+
+  poly_results <- rbind(poly_results, data.frame(
+    Degree           = degree,
+    Training_RMSE    = train_m$RMSE,
+    Development_RMSE = dev_m$RMSE,
+    Development_MAE  = dev_m$MAE,
+    Development_R2   = dev_m$R2
+  ))
+}
+
+best_poly_degree <- poly_results$Degree[which.min(poly_results$Development_RMSE)]
+cat("Best polynomial degree based on development RMSE:", best_poly_degree, "\n")
+print(poly_results)
+```
+
+## 6. Model 3: Random Forest
+
+```{r random_forest}
+set.seed(1)
+
+rf_grid <- expand.grid(
+  ntree = c(300, 500),
+  mtry = c(
+    min(5, length(all_features)),
+    min(10, length(all_features)),
+    min(15, length(all_features))
+  ),
+  maxnodes = c(30, 50),
+  nodesize = c(10)
+)
+
+rf_grid <- unique(rf_grid)
+
+rf_results <- data.frame(
+  ntree = integer(),
+  mtry = integer(),
+  maxnodes = integer(),
+  nodesize = integer(),
+  Training_MSE = numeric(),
+  Development_MSE = numeric(),
+  Training_RMSE = numeric(),
+  Development_RMSE = numeric(),
+  Development_MAE = numeric(),
+  Development_R2 = numeric()
+)
+
+rf_models <- list()
+
+for (i in 1:nrow(rf_grid)) {
+
+  rf_fit_i <- randomForest(
+    LOG.SALE.PRICE ~ .,
+    data = DataFrameTrain,
+    ntree = rf_grid$ntree[i],
+    mtry = rf_grid$mtry[i],
+    maxnodes = rf_grid$maxnodes[i],
+    nodesize = rf_grid$nodesize[i],
+    importance = TRUE
+  )
+
+  pred_train_i <- predict(rf_fit_i, newdata = DataFrameTrain)
+  pred_dev_i <- predict(rf_fit_i, newdata = DataFrameDev)
+
+  train_metrics_i <- evaluate_model(
+    DataFrameTrain$LOG.SALE.PRICE,
+    pred_train_i
+  )
+
+  dev_metrics_i <- evaluate_model(
+    DataFrameDev$LOG.SALE.PRICE,
+    pred_dev_i
+  )
+
+  rf_results <- rbind(
+    rf_results,
+    data.frame(
+      ntree = rf_grid$ntree[i],
+      mtry = rf_grid$mtry[i],
+      maxnodes = rf_grid$maxnodes[i],
+      nodesize = rf_grid$nodesize[i],
+      Training_MSE = train_metrics_i$MSE,
+      Development_MSE = dev_metrics_i$MSE,
+      Training_RMSE = train_metrics_i$RMSE,
+      Development_RMSE = dev_metrics_i$RMSE,
+      Development_MAE = dev_metrics_i$MAE,
+      Development_R2 = dev_metrics_i$R2
+    )
+  )
+
+  rf_models[[i]] <- rf_fit_i
+}
+
+print(rf_results)
+
+best_rf_index <- which.min(rf_results$Development_RMSE)
+rf_fit <- rf_models[[best_rf_index]]
+best_rf_setting <- rf_results[best_rf_index, ]
+
+
+```
+
+## 6.1 Best Random Forest Evaluation on Development Set
+
+```{r random_forest_eval}
+predict_train_rf <- predict(rf_fit, newdata = DataFrameTrain)
+predict_dev_rf   <- predict(rf_fit, newdata = DataFrameDev)
+
+rf_train_metrics <- evaluate_model(DataFrameTrain$LOG.SALE.PRICE, predict_train_rf)
+rf_dev_metrics   <- evaluate_model(DataFrameDev$LOG.SALE.PRICE,   predict_dev_rf)
+
+cat("Random Forest Training RMSE: $", round(rf_train_metrics$RMSE), "\n")
+cat("Random Forest Dev     RMSE: $", round(rf_dev_metrics$RMSE),   "\n")
+cat("Random Forest Dev     MAE:  $", round(rf_dev_metrics$MAE),    "\n")
+cat("Random Forest Dev     R2:  ",   round(rf_dev_metrics$R2, 4),  "\n")
+```
+
+## 6.2 Random Forest Residual Plot on Development Set
+
+```{r random_forest_residual_plot}
+actual_dollars_dev_rf <- exp(DataFrameDev$LOG.SALE.PRICE)
+pred_dollars_dev_rf   <- exp(predict_dev_rf)
+
+plot(
+  pred_dollars_dev_rf,
+  actual_dollars_dev_rf - pred_dollars_dev_rf,
+  main = "Random Forest Residuals on Development Set",
+  xlab = "Predicted Sale Price ($)",
+  ylab = "Residuals ($)",
+  col = "forestgreen", pch = 19, cex = 0.5
+)
+abline(h = 0, col = "red", lwd = 2)
+```
+
+## 6.3 Random Forest: Actual vs Predicted on Development Set
+
+```{r random_forest_actual_vs_predicted}
+plot(
+  actual_dollars_dev_rf,
+  pred_dollars_dev_rf,
+  main = "Random Forest: Actual vs Predicted",
+  xlab = "Actual Sale Price ($)",
+  ylab = "Predicted Sale Price ($)",
+  col = "forestgreen", pch = 19, cex = 0.5
+)
+abline(a = 0, b = 1, col = "red", lwd = 2)
+```
+
+## 7. Development Set Model Summary
+
+```{r development_model_summary}
+development_summary <- data.frame(
+  Model = c(
+    "Linear Regression",
+    "Random Forest"
+  ),
+  Training_RMSE = c(
+    lr_train_metrics$RMSE,
+    rf_train_metrics$RMSE
+  ),
+  Development_RMSE = c(
+    lr_dev_metrics$RMSE,
+    rf_dev_metrics$RMSE
+  ),
+  Development_MAE = c(
+    lr_dev_metrics$MAE,
+    rf_dev_metrics$MAE
+  ),
+  Development_R2 = c(
+    lr_dev_metrics$R2,
+    rf_dev_metrics$R2
+  )
+)
+
+print(development_summary)
+
+best_model_name <- development_summary$Model[
+  which.min(development_summary$Development_RMSE)
+]
+
+cat("Best model chosen by development RMSE:", best_model_name, "\n")
+```
+
+## 8. Final ERM / Final Test Evaluation for Best Model
+
+```{r final_test_evaluation}
+# Use the already-trained Random Forest (trained on 60% training set)
+# Evaluate ONCE on the final 20% test set
+
+final_pred_log <- predict(rf_fit, newdata = DataFrameFinalTest)
+
+# Convert predictions back to dollars
+final_pred <- exp(final_pred_log)
+
+# Evaluate on dollar scale
+final_metrics <- evaluate_model(
+  DataFrameFinalTest$LOG.SALE.PRICE,
+  final_pred_log
+)
+
+final_summary <- data.frame(
+  Best_Model      = "Random Forest",
+  Final_Test_RMSE = final_metrics$RMSE,
+  Final_Test_MAE  = final_metrics$MAE,
+  Final_Test_MSE  = final_metrics$MSE,
+  Final_Test_R2   = final_metrics$R2
+)
+
+print(final_summary)
+cat("Final RMSE: $", round(final_metrics$RMSE), "\n")
+cat("Final MAE:  $", round(final_metrics$MAE),  "\n")
+cat("Final R2:  ",   round(final_metrics$R2, 4), "\n")
+```
+
+## 8.1 Best Model Residual Plot on Final Test Set
+
+```{r best_model_residual_plot}
+actual_dollars_test <- exp(DataFrameFinalTest$LOG.SALE.PRICE)
+
+plot(
+  final_pred,
+  actual_dollars_test - final_pred,
+  main = paste("Best Model Residuals:", best_model_name),
+  xlab = "Predicted Sale Price ($)",
+  ylab = "Residuals ($)",
+  col = "steelblue", pch = 19, cex = 0.5
+)
+abline(h = 0, col = "red", lwd = 2)
+```
+
+## 8.2 Best Model: Actual vs Predicted on Final Test Set
+
+```{r best_model_actual_vs_predicted}
+plot(
+  actual_dollars_test,
+  final_pred,
+  main = "Best Model: Actual vs Predicted on Final Test Set",
+  xlab = "Actual Sale Price ($)",
+  ylab = "Predicted Sale Price ($)",
+  col = "steelblue", pch = 19, cex = 0.5
+)
+abline(a = 0, b = 1, col = "red", lwd = 2)
+```
+
+## 9. Random Forest Feature Set Comparison: ZIP vs Neighborhood
+
+After Random Forest was confirmed as the best model, we run it
+with three different location feature sets on the development
+set to determine which location representation works best.
+
+```{r rf_feature_comparison}
+set.seed(1)
+
+rf_feature_sets <- list(
+  "ZIP only" = c(
+    numeric_cols, zip_cols, tax_cols, month_cols,
+    building_category_cols, building_timeofsale_cols
+  ),
+  "Neighborhood only" = c(
+    numeric_cols, neighborhood_cols, tax_cols, month_cols,
+    building_category_cols, building_timeofsale_cols
+  ),
+  "ZIP + Neighborhood" = c(
+    numeric_cols, zip_cols, neighborhood_cols, tax_cols, month_cols,
+    building_category_cols, building_timeofsale_cols
+  )
+)
+
+rf_feature_results <- data.frame(
+  Feature_Set      = character(),
+  Development_RMSE = numeric(),
+  Development_MAE  = numeric(),
+  Development_R2   = numeric()
+)
+
+for (set_name in names(rf_feature_sets)) {
+  current_features <- rf_feature_sets[[set_name]]
+
+  train_data_exp <- DataFrameTrain[, c(current_features, "LOG.SALE.PRICE")]
+  dev_features   <- DataFrameDev[, current_features, drop = FALSE]
+
+  rf_exp <- randomForest(
+    LOG.SALE.PRICE ~ .,
+    data      = train_data_exp,
+    ntree     = 500,
+    mtry      = min(15, length(current_features)),
+    maxnodes  = 50,
+    nodesize  = 10
+  )
+
+  pred_dev_exp <- predict(rf_exp, newdata = dev_features)
+  metrics_exp  <- evaluate_model(DataFrameDev$LOG.SALE.PRICE, pred_dev_exp)
+
+  rf_feature_results <- rbind(
+    rf_feature_results,
+    data.frame(
+      Feature_Set      = set_name,
+      Development_RMSE = metrics_exp$RMSE,
+      Development_MAE  = metrics_exp$MAE,
+      Development_R2   = metrics_exp$R2
+    )
+  )
+}
+
+print(rf_feature_results)
+```
+
+## 9.1 Performance by Price Range (Best Model on Final Test Set)
+
+```{r performance_by_price_range}
+bins   <- c(0, 500000, 1000000, 2000000, Inf)
+labels <- c("Below $500K", "$500K-$1M", "$1M-$2M", "Above $2M")
+
+price_range_results <- data.frame(
+  Price_Range = character(),
+  n           = integer(),
+  RMSE        = numeric(),
+  MAE         = numeric()
+)
+
+test_actual <- actual_dollars_test
+
+for (i in seq_along(labels)) {
+  mask <- test_actual >= bins[i] & test_actual < bins[i + 1]
+  n    <- sum(mask)
+  if (n < 5) next
+
+  rmse   <- sqrt(mean((test_actual[mask] - final_pred[mask])^2))
+  mae    <- mean(abs(test_actual[mask] - final_pred[mask]))
+
+  price_range_results <- rbind(
+    price_range_results,
+    data.frame(
+      Price_Range = labels[i],
+      n = n, RMSE = rmse, MAE = mae
+    )
+  )
+}
+
+print(price_range_results)
+```
+
+## 9.2 Performance by ZIP Code (Best Model on Final Test Set)
+
+```{r performance_by_zip}
+zip_test <- DataFrameFinalTest[, zip_cols, drop = FALSE]
+
+get_zip_label <- function(row) {
+  which_one <- which(row == 1)
+  if (length(which_one) == 0) return("Reference ZIP")
+  return(names(row)[which_one[1]])
+}
+
+test_zip_labels <- apply(zip_test, 1, get_zip_label)
+
+zip_results <- data.frame(
+  ZIP  = character(),
+  n    = integer(),
+  RMSE = numeric(),
+  MAE  = numeric()
+)
+
+for (z in sort(unique(test_zip_labels))) {
+  mask <- test_zip_labels == z
+  n    <- sum(mask)
+  if (n < 5) next
+
+  rmse <- sqrt(mean((test_actual[mask] - final_pred[mask])^2))
+  mae  <- mean(abs(test_actual[mask] - final_pred[mask]))
+
+  zip_results <- rbind(
+    zip_results,
+    data.frame(ZIP = z, n = n, RMSE = rmse, MAE = mae)
+  )
+}
+
+zip_results <- zip_results[order(zip_results$RMSE), ]
+print(zip_results)
+```
